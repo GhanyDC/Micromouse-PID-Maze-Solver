@@ -1,0 +1,210 @@
+/* ============================================================== *
+ *  GA12-N20 300 rpm  +  TB6612FNG
+ *  Idle until an object is closer than TRIP_CM on either side,
+ *  then pivot 90 ° toward that side and stop.
+ * ============================================================== */
+
+#include <PID_v1.h>
+
+/* ───────── USER CONSTANTS ──────────────────────────────────── */
+const uint16_t COUNTS_PER_REV = 720;        //      encoder CPR
+const float    WHEEL_R        = 0.0215;     // m    43 mm Ø wheel
+const float    TRACK_WIDTH    = 0.085;      // m    centre-to-centre
+const float    SAMPLE_MS      = 25.0;       // ms   wheel PID loop = 40 Hz
+const double   TRIP_CM        = 15.0;       // cm   object threshold
+const int      PIVOT_RPM      = 120;        // wheel rpm during turn
+
+/* in-place 90 ° counts  (equal & opposite wheels) */
+const long PIVOT90 = (long)(
+        ((3.1415926/2.0) * (TRACK_WIDTH/2.0)) /    // metres travelled
+        (2.0*3.1415926*WHEEL_R) *                  // → revolutions
+        COUNTS_PER_REV + 0.5);                     // → encoder counts
+
+/* ───────── PID GAINS (locked from tuning) ─────────────────── */
+double Kp = 1.8, Ki = 7.0, Kd = 0.12;       //  ← Ki bumped to 7
+
+/* ───────── MOTOR & SENSOR PINS ────────────────────────────── */
+#define AIN1 4
+#define AIN2 5
+#define PWMA 6
+#define BIN1 7
+#define BIN2 8
+#define PWMB 9
+#define STBY 12
+#define ENC_A1 2
+#define ENC_B1 10
+#define ENC_A2 3
+#define ENC_B2 11
+/* HC-SR04 pins */
+#define TRIG_FRONT A0
+#define ECHO_FRONT A1
+#define TRIG_LEFT  A2
+#define ECHO_LEFT  A3
+#define TRIG_RIGHT A4
+#define ECHO_RIGHT A5
+
+/* ───────── ENCODERS ───────────────────────────────────────── */
+volatile long encL = 0, encR = 0;
+
+/* ───────── PID OBJECTS ───────────────────────────────────── */
+double rpmSetL, rpmMeasL, pwmOutL;
+double rpmSetR, rpmMeasR, pwmOutR;
+PID pidL(&rpmMeasL, &pwmOutL, &rpmSetL, Kp, Ki, Kd, DIRECT);
+PID pidR(&rpmMeasR, &pwmOutR, &rpmSetR, Kp, Ki, Kd, DIRECT);
+
+/* ───────── FSM STATES ────────────────────────────────────── */
+enum Mode { STANDBY, PIVOT_LEFT, PIVOT_RIGHT, DONE } mode = STANDBY;
+uint32_t lastSample = 0;
+
+/* ========================================================== */
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(AIN1,OUTPUT); pinMode(AIN2,OUTPUT); pinMode(PWMA,OUTPUT);
+  pinMode(BIN1,OUTPUT); pinMode(BIN2,OUTPUT); pinMode(PWMB,OUTPUT);
+  pinMode(STBY,OUTPUT); digitalWrite(STBY,HIGH);
+
+  pinMode(ENC_A1,INPUT_PULLUP); pinMode(ENC_B1,INPUT_PULLUP);
+  pinMode(ENC_A2,INPUT_PULLUP); pinMode(ENC_B2,INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_A1), isrL, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_A2), isrR, CHANGE);
+
+  pinMode(TRIG_LEFT,OUTPUT);  pinMode(ECHO_LEFT,INPUT);
+  pinMode(TRIG_RIGHT,OUTPUT); pinMode(ECHO_RIGHT,INPUT);
+
+  /* wheel-speed PID config */
+  rpmSetL = rpmSetR = 0;                   // idle at start
+  pidL.SetSampleTime(SAMPLE_MS);
+  pidR.SetSampleTime(SAMPLE_MS);
+  pidL.SetOutputLimits(-220,220);          // allow reverse
+  pidR.SetOutputLimits(-220,220);
+  pidL.SetMode(AUTOMATIC); pidR.SetMode(AUTOMATIC);
+
+  Serial.print(F("PIVOT90 counts: ")); Serial.println(PIVOT90);
+  Serial.println(F("Stand-by…"));
+}
+
+/* ========================================================== */
+void loop() {
+
+  /* 40 Hz wheel PID service */
+  if (millis() - lastSample >= SAMPLE_MS) {
+    lastSample += SAMPLE_MS;
+    wheelService();
+  }
+
+  /* ───── behaviour FSM ───── */
+  switch (mode) {
+
+  case STANDBY: {
+      double dL = readCM(TRIG_LEFT ,ECHO_LEFT );
+      double dR = readCM(TRIG_RIGHT,ECHO_RIGHT);
+      if (dL > 0 && dL < TRIP_CM) {         // object on LEFT → turn LEFT
+        startPivot(+1);                     // +1 = CCW
+        mode = PIVOT_LEFT;
+        Serial.println(F("Object on left → pivot CCW 90°"));
+      }
+      else if (dR > 0 && dR < TRIP_CM) {    // object on RIGHT → turn RIGHT
+        startPivot(-1);                     // −1 = CW
+        mode = PIVOT_RIGHT;
+        Serial.println(F("Object on right → pivot CW 90°"));
+      }
+      break;
+    }
+
+  case PIVOT_LEFT:
+  case PIVOT_RIGHT:
+      if (abs(encL) >= PIVOT90 && abs(encR) >= PIVOT90) {
+        rpmSetL = rpmSetR = 0;              // stop wheels
+        mode = DONE;
+        Serial.println(F("Pivot complete."));
+      }
+      break;
+
+  case DONE:
+      // remain stopped; reset board to test again
+      break;
+  }
+}
+
+/* ==========================================================
+ *            Wheel-PID service  (25 ms)
+ * ==========================================================*/
+void wheelService() {
+  static long lastL=0,lastR=0;
+
+  noInterrupts();
+    long nowL=encL, nowR=encR;
+  interrupts();
+
+  long dL = nowL - lastL;
+  long dR = nowR - lastR;
+  lastL = nowL; lastR = nowR;
+
+  rpmMeasL = (dL * 60000.0 / SAMPLE_MS) / COUNTS_PER_REV;
+  rpmMeasR = (dR * 60000.0 / SAMPLE_MS) / COUNTS_PER_REV;
+
+  /* 1-pole filter (alpha = 0.30) */
+  const double ALPHA = 0.30;
+  static double fl=0, fr=0;
+  fl = (1-ALPHA)*fl + ALPHA*rpmMeasL;
+  fr = (1-ALPHA)*fr + ALPHA*rpmMeasR;
+  rpmMeasL = fl; rpmMeasR = fr;
+
+  pidL.Compute(); pidR.Compute();
+
+  driveWheel(pwmOutL, AIN1, AIN2, PWMA);
+  driveWheel(pwmOutR, BIN1, BIN2, PWMB);
+
+  /* uncomment to plot
+  Serial.print(rpmSetL); Serial.print(',');
+  Serial.print(rpmMeasL); Serial.print(',');
+  Serial.print(rpmSetR); Serial.print(',');
+  Serial.println(rpmMeasR);
+  */
+}
+
+/* sign-aware drive helper */
+void driveWheel(double pwm, uint8_t in1,uint8_t in2,uint8_t pwmPin) {
+  bool fwd = pwm >= 0;
+  uint8_t duty = constrain(abs((int)pwm),0,255);
+  digitalWrite(in1,fwd); digitalWrite(in2,!fwd);
+  analogWrite(pwmPin,duty);
+}
+
+/* startPivot(dir) : dir = +1 CCW  (turn left)
+ *                            −1 CW   (turn right) */
+void startPivot(int dir) {
+  pidL.SetMode(MANUAL); pidR.SetMode(MANUAL);      // clear I term
+  encL = encR = 0;
+
+  rpmSetL =  dir * (-PIVOT_RPM);   // opposite rpm
+  rpmSetR =  dir * (+PIVOT_RPM);   // note sign
+
+  pidL.SetMode(AUTOMATIC); pidR.SetMode(AUTOMATIC);
+}
+
+/* HC-SR04 distance in cm  (returns −1 on timeout) */
+double readCM(uint8_t trig,uint8_t echo) {
+  digitalWrite(trig,LOW);  delayMicroseconds(2);
+  digitalWrite(trig,HIGH); delayMicroseconds(10);
+  digitalWrite(trig,LOW);
+  unsigned long us = pulseIn(echo,HIGH,25000UL);   // 25 ms max
+  if (us==0) return -1;
+  return us*0.01715;     // cm
+}
+
+/* ───────── Encoder ISRs ───────── */
+void isrL() {
+  if (digitalRead(ENC_A1) != digitalRead(ENC_B1)) 
+    ++encL; 
+  else 
+    --encL; 
+}
+
+void isrR() {
+  if (digitalRead(ENC_A2) == digitalRead(ENC_B2)) 
+    ++encR; 
+  else 
+    --encR; 
+}
